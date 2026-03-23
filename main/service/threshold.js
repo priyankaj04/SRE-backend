@@ -36,10 +36,7 @@ async function seedDefaultThresholds(resources) {
 
   if (rows.length === 0) return;
 
-  await db('alert_thresholds')
-    .insert(rows)
-    .onConflict(['resource_id', 'metric_name'])
-    .ignore(); // never overwrite user-modified thresholds
+  await db('alert_thresholds').insert(rows).onConflict(['resource_id', 'metric_name']).ignore(); // never overwrite user-modified thresholds
 
   console.log(`[thresholds] seeded ${rows.length} defaults for ${resources.length} resources`);
 }

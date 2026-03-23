@@ -15,7 +15,7 @@ exports.up = async function (knex) {
     t.timestamp('last_seen_at').notNullable().defaultTo(knex.fn.now());
     t.timestamp('created_at').notNullable().defaultTo(knex.fn.now());
     t.timestamp('updated_at').notNullable().defaultTo(knex.fn.now());
-    t.timestamp('deleted_at');
+    t.timestamp('de                                                                                                                                                                                                                                                                                                                      n8j88leted_at');
 
     t.unique(['cloud_account_id', 'external_id']);
     t.index('org_id');
