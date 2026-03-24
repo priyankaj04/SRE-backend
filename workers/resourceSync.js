@@ -11,7 +11,7 @@ const { describeLambda } = require('../main/lib/aws/lambda');
 const { describeElb }    = require('../main/lib/aws/elb');
 const { normalizeEc2, normalizeRds, normalizeS3, normalizeLambda, normalizeElb } = require('../main/lib/aws/normalize');
 const { upsertResources, markStaleResources } = require('../main/service/resource');
-const { seedDefaultThresholds }               = require('../main/service/threshold');
+const { seedDefaultThresholds, syncAlarmsFromAws } = require('../main/service/threshold');
 
 /**
  * Bull processor — discovers all AWS resources for a cloud account and upserts them into DB.
@@ -38,18 +38,21 @@ module.exports = async function resourceSyncProcessor(job) {
   const context = { orgId: account.org_id, cloudAccountId: account.id };
 
   // Run all service describers across all regions in parallel
+  // Preserve awsCreds per region so we can use them for alarm sync after upsert
   const regionTasks = regions.map((region) => {
     const awsCreds = buildAwsCredentials(account.auth_type, creds, region);
-    return runRegionSync(awsCreds, region, context);
+    return runRegionSync(awsCreds, region, context).then((resources) => ({ resources, awsCreds, region }));
   });
 
-  const results     = await Promise.allSettled(regionTasks);
+  const results      = await Promise.allSettled(regionTasks);
   const allResources = [];
+  const regionMeta   = []; // { awsCreds, region } for successful regions
 
   for (let i = 0; i < results.length; i++) {
     const result = results[i];
     if (result.status === 'fulfilled') {
-      allResources.push(...result.value);
+      allResources.push(...result.value.resources);
+      regionMeta.push({ awsCreds: result.value.awsCreds, region: result.value.region });
     } else {
       // Log region failure but continue — partial sync is better than no sync
       console.error(`[sync] region=${regions[i]} failed  error=${result.reason?.message}`);
@@ -65,9 +68,22 @@ module.exports = async function resourceSyncProcessor(job) {
       .where({ cloud_account_id })
       .whereNull('deleted_at')
       .whereIn('external_id', allResources.map((r) => r.external_id))
-      .select('id', 'service');
+      .select('id', 'service', 'external_id', 'name', 'region');
 
     await seedDefaultThresholds(resourceRows);
+
+    // Sync CloudWatch alarms from AWS into alert_thresholds, per region
+    for (const { awsCreds, region } of regionMeta) {
+      const regionResources = resourceRows.filter((r) => r.region === region);
+      if (regionResources.length === 0) continue;
+
+      try {
+        await syncAlarmsFromAws(awsCreds, regionResources, cloud_account_id);
+      } catch (err) {
+        console.error(`[alarmSync] region=${region} failed  error=${err.message}`);
+        Sentry.captureException(err, { extra: { cloud_account_id, region } });
+      }
+    }
   }
 
   // Soft-delete resources not seen in this sync

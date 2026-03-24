@@ -1,4 +1,4 @@
-'use strict';
+'use strict'; 
 
 exports.up = async function (knex) {
   await knex.schema.createTable('resources', (t) => {

@@ -2,6 +2,16 @@
 
 const db = require('../db');
 const { DEFAULT_THRESHOLDS } = require('../lib/aws/defaultThresholds');
+const { listCloudWatchAlarms, ensureSnsTopic, ensureSnsSubscription, attachSnsTopicToAlarm } = require('../lib/aws/cloudwatchAlarm');
+
+// Reverse map: AWS namespace → { dimensionName, getValue(resource) }
+// Mirrors the ALARM_CONFIGS in lib/aws/cloudwatchAlarm.js
+const NAMESPACE_TO_DIMENSION = {
+  'AWS/EC2':            { name: 'InstanceId',           getValue: (r) => r.external_id },
+  'AWS/RDS':            { name: 'DBInstanceIdentifier', getValue: (r) => r.external_id },
+  'AWS/Lambda':         { name: 'FunctionName',         getValue: (r) => r.name },
+  'AWS/ApplicationELB': { name: 'LoadBalancer',         getValue: (r) => r.external_id.split(':loadbalancer/')[1] },
+};
 
 /**
  * Seed default thresholds for newly synced resources.
@@ -168,4 +178,142 @@ async function setAlarmInfo(thresholdId, alarmName, snsTopicArn) {
     .update({ alarm_name: alarmName, sns_topic_arn: snsTopicArn, updated_at: db.fn.now() });
 }
 
-module.exports = { seedDefaultThresholds, listThresholds, updateThreshold, deleteThreshold, setAlarmInfo };
+/**
+ * Pulls all CloudWatch alarms for a region and syncs them into alert_thresholds.
+ * New alarms (exist in AWS, not in DB) are inserted.
+ * Changed alarms (values differ from DB) are updated.
+ * Ensures an SNS topic exists and attaches it to any alarm that is missing it.
+ *
+ * @param {object} awsCreds       — credentials for a specific region
+ * @param {Array}  resources      — resource rows for that region: { id, service, external_id, name }
+ * @param {string} cloudAccountId — used to name the SNS topic
+ */
+async function syncAlarmsFromAws(awsCreds, resources, cloudAccountId) {
+  if (!resources || resources.length === 0) return;
+
+  const alarms = await listCloudWatchAlarms(awsCreds);
+  if (alarms.length === 0) return;
+
+  // Ensure SNS topic exists and webhook is subscribed
+  const webhookUrl = process.env.WEBHOOK_URL;
+  let snsTopicArn  = null;
+
+  if (webhookUrl) {
+    snsTopicArn = await ensureSnsTopic(awsCreds, cloudAccountId);
+    await ensureSnsSubscription(awsCreds, snsTopicArn, `${webhookUrl}`);
+  }
+
+  // Build lookup: namespace → (dimensionValue → resource row)
+  const resourceMap = new Map();
+  for (const [ns, cfg] of Object.entries(NAMESPACE_TO_DIMENSION)) {
+    const nsMap = new Map();
+    for (const r of resources) {
+      try {
+        const val = cfg.getValue(r);
+        if (val) nsMap.set(val, r);
+      } catch (_) {
+        // skip resources where dimension extraction fails (e.g. ELB external_id missing suffix)
+      }
+    }
+    resourceMap.set(ns, nsMap);
+  }
+
+  // Load all existing thresholds for these resources in one query
+  const resourceIds      = resources.map((r) => r.id);
+  const existingInDb     = await db('alert_thresholds')
+    .whereIn('resource_id', resourceIds)
+    .whereNull('deleted_at')
+    .select('id', 'resource_id', 'metric_name', 'threshold_value', 'operator', 'evaluation_periods', 'period', 'alarm_name', 'sns_topic_arn');
+
+  // Build lookup: "resourceId::metricName" → threshold row
+  const thresholdMap = new Map();
+  for (const t of existingInDb) {
+    thresholdMap.set(`${t.resource_id}::${t.metric_name}`, t);
+  }
+
+  const now      = new Date().toISOString();
+  const toInsert = [];
+  const toUpdate = [];
+
+  for (const alarm of alarms) {
+    const dimCfg = NAMESPACE_TO_DIMENSION[alarm.Namespace];
+    if (!dimCfg) continue;
+
+    const nsMap = resourceMap.get(alarm.Namespace);
+    if (!nsMap) continue;
+
+    const dim = (alarm.Dimensions || []).find((d) => d.Name === dimCfg.name);
+    if (!dim) continue;
+
+    const resource = nsMap.get(dim.Value);
+    if (!resource) continue; // alarm belongs to a resource not in our DB
+
+    // Use the synced SNS topic ARN if we created/fetched one, else fall back to whatever the alarm has
+    const alarmSnsArn = snsTopicArn || (alarm.AlarmActions || [])[0] || null;
+
+    // If we have an SNS topic and the alarm is missing it, attach it in AWS
+    if (snsTopicArn && !(alarm.AlarmActions || []).includes(snsTopicArn)) {
+      try {
+        await attachSnsTopicToAlarm(awsCreds, alarm, snsTopicArn);
+      } catch (err) {
+        console.error(`[alarmSync] failed to attach SNS to alarm=${alarm.AlarmName}  error=${err.message}`);
+      }
+    }
+
+    const key            = `${resource.id}::${alarm.MetricName}`;
+    const existingRecord = thresholdMap.get(key);
+
+    if (!existingRecord) {
+      toInsert.push({
+        resource_id:        resource.id,
+        metric_name:        alarm.MetricName,
+        operator:           alarm.ComparisonOperator,
+        threshold_value:    alarm.Threshold,
+        evaluation_periods: alarm.EvaluationPeriods,
+        period:             alarm.Period,
+        alarm_name:         alarm.AlarmName,
+        sns_topic_arn:      alarmSnsArn,
+        is_default:         false,
+        created_at:         now,
+        updated_at:         now,
+      });
+    } else {
+      // Check if any value has changed in AWS
+      const changed =
+        existingRecord.threshold_value    !== alarm.Threshold             ||
+        existingRecord.operator           !== alarm.ComparisonOperator    ||
+        existingRecord.evaluation_periods !== alarm.EvaluationPeriods     ||
+        existingRecord.period             !== alarm.Period                 ||
+        existingRecord.alarm_name         !== alarm.AlarmName             ||
+        (snsTopicArn && existingRecord.sns_topic_arn !== snsTopicArn);
+
+      if (changed) {
+        toUpdate.push({
+          id:                 existingRecord.id,
+          threshold_value:    alarm.Threshold,
+          operator:           alarm.ComparisonOperator,
+          evaluation_periods: alarm.EvaluationPeriods,
+          period:             alarm.Period,
+          alarm_name:         alarm.AlarmName,
+          ...(snsTopicArn ? { sns_topic_arn: snsTopicArn } : {}),
+          updated_at:         now,
+        });
+      }
+    }
+  }
+
+  if (toInsert.length > 0) {
+    await db('alert_thresholds')
+      .insert(toInsert)
+      .onConflict(['resource_id', 'metric_name'])
+      .merge(['threshold_value', 'operator', 'evaluation_periods', 'period', 'alarm_name', 'sns_topic_arn', 'updated_at']);
+  }
+
+  for (const { id, ...changes } of toUpdate) {
+    await db('alert_thresholds').where({ id }).update(changes);
+  }
+
+  console.log(`[alarmSync] inserted=${toInsert.length} updated=${toUpdate.length}`);
+}
+
+module.exports = { seedDefaultThresholds, listThresholds, updateThreshold, deleteThreshold, setAlarmInfo, syncAlarmsFromAws };
