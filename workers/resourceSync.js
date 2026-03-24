@@ -11,7 +11,7 @@ const { describeLambda } = require('../main/lib/aws/lambda');
 const { describeElb }    = require('../main/lib/aws/elb');
 const { normalizeEc2, normalizeRds, normalizeS3, normalizeLambda, normalizeElb } = require('../main/lib/aws/normalize');
 const { upsertResources, markStaleResources } = require('../main/service/resource');
-const { seedDefaultThresholds, syncAlarmsFromAws } = require('../main/service/threshold');
+const { syncAlarmsFromAws } = require('../main/service/threshold');
 
 /**
  * Bull processor — discovers all AWS resources for a cloud account and upserts them into DB.
@@ -60,7 +60,7 @@ module.exports = async function resourceSyncProcessor(job) {
     }
   }
 
-  // Upsert all discovered resources and seed default thresholds for new ones
+  // Upsert all discovered resources
   if (allResources.length > 0) {
     await upsertResources(allResources);
 
@@ -69,8 +69,6 @@ module.exports = async function resourceSyncProcessor(job) {
       .whereNull('deleted_at')
       .whereIn('external_id', allResources.map((r) => r.external_id))
       .select('id', 'service', 'external_id', 'name', 'region');
-
-    await seedDefaultThresholds(resourceRows);
 
     // Sync CloudWatch alarms from AWS into alert_thresholds, per region
     for (const { awsCreds, region } of regionMeta) {

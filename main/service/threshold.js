@@ -316,4 +316,95 @@ async function syncAlarmsFromAws(awsCreds, resources, cloudAccountId) {
   console.log(`[alarmSync] inserted=${toInsert.length} updated=${toUpdate.length}`);
 }
 
-module.exports = { seedDefaultThresholds, listThresholds, updateThreshold, deleteThreshold, setAlarmInfo, syncAlarmsFromAws };
+/**
+ * List metric definitions from DEFAULT_THRESHOLDS that have no DB row yet for this resource.
+ *
+ * @param {string} resourceId
+ * @param {string} orgId
+ */
+async function listAvailableThresholds(resourceId, orgId) {
+  const resource = await db('resources')
+    .where({ id: resourceId, org_id: orgId })
+    .whereNull('deleted_at')
+    .first();
+
+  if (!resource) {
+    const err = new Error('Resource not found.');
+    err.status = 404;
+    throw err;
+  }
+
+  const defaults = DEFAULT_THRESHOLDS[resource.service];
+  if (!defaults || defaults.length === 0) return [];
+
+  // Find metric names already configured for this resource
+  const existing = await db('alert_thresholds')
+    .where({ resource_id: resourceId })
+    .whereNull('deleted_at')
+    .pluck('metric_name');
+
+  const existingSet = new Set(existing);
+
+  // Return default definitions not yet in DB
+  return defaults.filter((t) => !existingSet.has(t.metric_name));
+}
+
+/**
+ * Insert a new threshold from the DEFAULT_THRESHOLDS catalog and return resource + threshold.
+ * Does not create a CloudWatch alarm — caller handles that.
+ *
+ * @param {string} resourceId
+ * @param {string} orgId
+ * @param {string} metricName
+ * @param {string} userId
+ */
+async function createThreshold(resourceId, orgId, metricName, userId) {
+  const resource = await db('resources')
+    .where({ id: resourceId, org_id: orgId })
+    .whereNull('deleted_at')
+    .first();
+
+  if (!resource) {
+    const err = new Error('Resource not found.');
+    err.status = 404;
+    throw err;
+  }
+
+  const defaults = DEFAULT_THRESHOLDS[resource.service];
+  const tpl = defaults && defaults.find((t) => t.metric_name === metricName);
+
+  if (!tpl) {
+    const err = new Error(`No default threshold definition found for metric "${metricName}".`);
+    err.status = 400;
+    throw err;
+  }
+
+  // Conflict means it already exists (not soft-deleted) — surface it as a 409
+  const existing = await db('alert_thresholds')
+    .where({ resource_id: resourceId, metric_name: metricName })
+    .whereNull('deleted_at')
+    .first();
+
+  if (existing) {
+    const err = new Error('Threshold for this metric already exists.');
+    err.status = 409;
+    throw err;
+  }
+
+  const [threshold] = await db('alert_thresholds')
+    .insert({
+      resource_id:        resourceId,
+      metric_name:        tpl.metric_name,
+      operator:           tpl.operator,
+      threshold_value:    tpl.threshold_value,
+      evaluation_periods: tpl.evaluation_periods,
+      period:             tpl.period,
+      is_default:         true,
+      created_by:         userId,
+    })
+    .returning('*');
+
+  return { resource, threshold };
+}
+
+module.exports = { seedDefaultThresholds, listThresholds, updateThreshold, deleteThreshold, setAlarmInfo, syncAlarmsFromAws, listAvailableThresholds, createThreshold };

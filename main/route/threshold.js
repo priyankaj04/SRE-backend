@@ -3,11 +3,19 @@
 /**
  * Threshold routes — manage alert thresholds for a resource.
  *
- * Purpose: Let users view and modify per-resource alert thresholds.
- *          Saving a threshold creates/updates a live CloudWatch Alarm in AWS.
+ * Purpose: Let users view, add, and modify per-resource alert thresholds.
+ *          Saving or adding a threshold creates/updates a live CloudWatch Alarm in AWS.
  *
  * GET    /cloud-accounts/:accountId/resources/:resourceId/thresholds
  *        Input: none | Response: { status, data: threshold[] }
+ *
+ * GET    /cloud-accounts/:accountId/resources/:resourceId/thresholds/available
+ *        Input: none | Response: { status, data: thresholdDefinition[] }
+ *        Returns metric definitions from the catalog that have no DB row yet.
+ *
+ * POST   /cloud-accounts/:accountId/resources/:resourceId/thresholds
+ *        Input: { metric_name* } | Response: { status, data: threshold }
+ *        Inserts a threshold from defaults and creates a CloudWatch alarm in AWS.
  *
  * PATCH  /cloud-accounts/:accountId/resources/:resourceId/thresholds/:thresholdId
  *        Input: { threshold_value* (required), operator?, evaluation_periods?, period? }
@@ -21,7 +29,7 @@ const router  = require('express').Router({ mergeParams: true });
 const { authenticate } = require('../middleware');
 const { decrypt }      = require('../lib/crypto');
 const db               = require('../db');
-const { listThresholds, updateThreshold, deleteThreshold, setAlarmInfo } = require('../service/threshold');
+const { listThresholds, updateThreshold, deleteThreshold, setAlarmInfo, listAvailableThresholds, createThreshold } = require('../service/threshold');
 const { ensureSnsTopic, ensureSnsSubscription, putCloudWatchAlarm, deleteCloudWatchAlarm } = require('../lib/aws/cloudwatchAlarm');
 
 const asyncHandler = require('../lib/asyncHandler');
@@ -57,6 +65,68 @@ router.get(
 
     const thresholds = await listThresholds(resourceId, req.cloudAccount.org_id);
     res.status(200).json({ status: 1, data: thresholds });
+  })
+);
+
+// GET /cloud-accounts/:accountId/resources/:resourceId/thresholds/available
+router.get(
+  '/available',
+  authenticate,
+  asyncHandler(verifyAccountOwnership),
+  asyncHandler(async (req, res) => {
+    const { resourceId } = req.params;
+    console.log(`[route] GET /thresholds/available  resourceId=${resourceId}`);
+
+    const available = await listAvailableThresholds(resourceId, req.cloudAccount.org_id);
+    res.status(200).json({ status: 1, data: available });
+  })
+);
+
+// POST /cloud-accounts/:accountId/resources/:resourceId/thresholds
+// metric_name — required: the metric to add (must exist in DEFAULT_THRESHOLDS for this resource's service)
+router.post(
+  '/',
+  authenticate,
+  asyncHandler(verifyAccountOwnership),
+  asyncHandler(async (req, res) => {
+    const { accountId, resourceId } = req.params;
+
+    // metric_name — required
+    const { metric_name } = req.body;
+    if (!metric_name || typeof metric_name !== 'string' || !metric_name.trim()) {
+      return res.status(400).json({ status: 0, error: 'metric_name is required.' });
+    }
+
+    console.log(`[route] POST /thresholds  resourceId=${resourceId}  metric_name=${metric_name}`);
+
+    const { resource, threshold } = await createThreshold(
+      resourceId,
+      req.cloudAccount.org_id,
+      metric_name.trim(),
+      req.user.id
+    );
+
+    // CloudWatch alarm creation requires a public WEBHOOK_URL for SNS delivery
+    const WEBHOOK_URL = process.env.WEBHOOK_URL;
+    if (!WEBHOOK_URL) {
+      console.warn('[thresholds] WEBHOOK_URL not set — threshold saved but CloudWatch alarm not created');
+      return res.status(201).json({ status: 1, data: threshold });
+    }
+
+    const creds    = JSON.parse(decrypt(req.cloudAccount.encrypted_creds));
+    const awsCreds = buildAwsCredentials(req.cloudAccount.auth_type, creds, resource.region);
+
+    // One SNS topic per cloud account — created if it doesn't exist yet
+    const snsTopicArn = await ensureSnsTopic(awsCreds, accountId);
+    await ensureSnsSubscription(awsCreds, snsTopicArn, WEBHOOK_URL);
+
+    const alarmName = await putCloudWatchAlarm(awsCreds, resource, threshold, snsTopicArn);
+    await setAlarmInfo(threshold.id, alarmName, snsTopicArn);
+
+    res.status(201).json({
+      status: 1,
+      data: { ...threshold, alarm_name: alarmName, sns_topic_arn: snsTopicArn },
+    });
   })
 );
 
