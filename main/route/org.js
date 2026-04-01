@@ -7,7 +7,8 @@
  * GET    /orgs/:orgId/members                      Input: ?page ?limit                           Response: { status, data: member[], meta }
  * PATCH  /orgs/:orgId/members/:userId/role         Input: { role* }  (owner only)               Response: { status, data: { userId, role } }
  * DELETE /orgs/:orgId/members/:userId              Input: none       (admin+)                    Response: { status, message }
- * GET    /orgs/:orgId/incidents                    Input: ?limit ?offset (viewer+)               Response: { status, data, meta }
+ * GET    /orgs/:orgId/dashboard/summary             Input: none       (viewer+)                   Response: { status, data: summary }
+ * GET    /orgs/:orgId/incidents                    Input: ?limit ?offset ?status (viewer+)       Response: { status, data, meta }
  * GET    /orgs/:orgId/incidents/:incidentId        Input: none       (viewer+)                   Response: { status, data: incident }
  * POST   /orgs/:orgId/cloud-accounts               Input: { name*, provider*, authType*, credentials*, regions } (admin+) Response: { status, data: account }
  * GET    /orgs/:orgId/cloud-accounts               Input: none       (viewer+)                   Response: { status, data: account[] }
@@ -106,11 +107,27 @@ router.delete(
   })
 );
 
+// ── Dashboard routes ──────────────────────────────────────────────────────────
+
+const { getDashboardSummary } = require('../service/dashboard');
+
+// GET /orgs/:orgId/dashboard/summary — live metrics aggregated from AWS CloudWatch (viewer+)
+router.get(
+  '/:orgId/dashboard/summary',
+  authenticate,
+  asyncHandler(orgMember),
+  asyncHandler(async (req, res) => {
+    const summary = await getDashboardSummary(req.params.orgId);
+    res.status(200).json({ status: 1, data: summary });
+  })
+);
+
 // ── Incident routes ───────────────────────────────────────────────────────────
 
 const { listOrgIncidents, getIncidentById } = require('../service/incident');
 
 // GET /orgs/:orgId/incidents — all incidents in org, newest first (viewer+)
+// Optional ?status=open|resolved to filter by incident status
 router.get(
   '/:orgId/incidents',
   authenticate,
@@ -120,7 +137,10 @@ router.get(
     const limit  = Math.min(parseInt(req.query.limit,  10) || 20, 100);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0,  0);
 
-    const result = await listOrgIncidents(req.params.orgId, { limit, offset });
+    // status filter — only pass through valid values
+    const status = ['open', 'resolved'].includes(req.query.status) ? req.query.status : undefined;
+
+    const result = await listOrgIncidents(req.params.orgId, { limit, offset, status });
     res.status(200).json({ status: 1, ...result });
   })
 );

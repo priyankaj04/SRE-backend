@@ -75,15 +75,18 @@ async function listIncidents(resourceId, orgId) {
  * Joins resources + cloud_accounts to provide context for each incident.
  *
  * @param {string} orgId
- * @param {{ limit: number, offset: number }} opts
+ * @param {{ limit: number, offset: number, status?: 'open'|'resolved' }} opts
  */
-async function listOrgIncidents(orgId, { limit = 20, offset = 0 } = {}) {
+async function listOrgIncidents(orgId, { limit = 20, offset = 0, status } = {}) {
   const query = db('incidents as i')
     .join('resources as r',       'i.resource_id',       'r.id')
     .join('cloud_accounts as ca', 'r.cloud_account_id',  'ca.id')
     .where('ca.org_id', orgId)
     .whereNull('ca.deleted_at')
     .whereNull('r.deleted_at');
+
+  // Filter by incident status when provided
+  if (status) query.where('i.status', status);
 
   const [{ count }] = await query.clone().count('i.id as count');
   const total = parseInt(count, 10);
@@ -97,6 +100,9 @@ async function listOrgIncidents(orgId, { limit = 20, offset = 0 } = {}) {
       'i.metric_name',
       'i.threshold_value',
       'i.state',
+      'i.status',
+      'i.priority',
+      'i.assigned_to',
       'i.started_at',
       'i.resolved_at',
       'i.created_at',
