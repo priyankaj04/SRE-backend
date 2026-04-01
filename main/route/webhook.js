@@ -19,6 +19,7 @@ const Sentry     = require('@sentry/node');
 const db         = require('../db');
 const asyncHandler = require('../lib/asyncHandler');
 const { createIncident } = require('../service/incident');
+const { notifyAlertCreated } = require('../lib/slack');
 
 // SNS sends Content-Type: text/plain — parse it as text for this router only
 router.use(express.text({ type: '*/*' }));
@@ -85,7 +86,7 @@ router.post(
       // Create incident when alarm fires (ALARM or INSUFFICIENT_DATA)
       if (newState === 'ALARM' || newState === 'INSUFFICIENT_DATA') {
         try {
-          await createIncident({
+          const incident = await createIncident({
             resourceId:     threshold.resource_id,
             thresholdId:    threshold.id,
             metricName:     threshold.metric_name,
@@ -94,6 +95,7 @@ router.post(
             state:          newState,
             rawPayload:     message,
           });
+          notifyAlertCreated(incident);
         } catch (err) {
           console.error(`[webhook] incident creation failed  thresholdId=${thresholdId}  error=${err.message}`);
           Sentry.captureException(err);

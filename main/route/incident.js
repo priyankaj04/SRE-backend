@@ -22,6 +22,7 @@ const { authenticate } = require('../middleware');
 const asyncHandler   = require('../lib/asyncHandler');
 const db = require('../db');
 const { listIncidents, resolveIncident, updateIncidentConfig } = require('../service/incident');
+const { notifyAlertResolved } = require('../lib/slack');
 
 // ── Middleware shared by nested resource-level route ──────────────────────────
 
@@ -89,6 +90,12 @@ incidentRouter.patch(
   asyncHandler(verifyIncidentAccess),
   asyncHandler(async (req, res) => {
     const result = await resolveIncident(req.params.incidentId, req.orgId);
+
+    // Look up the resolver's name to include in the Slack notification
+    const resolver = await db('users').where({ id: req.user.id }).whereNull('deleted_at').select('full_name', 'email').first();
+    const resolvedByName = resolver ? (resolver.full_name || resolver.email) : req.user.id;
+    notifyAlertResolved(result, resolvedByName);
+
     res.status(200).json({ status: 1, data: result });
   })
 );
