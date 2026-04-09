@@ -24,3 +24,10 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+API.md
+CLAUDE.md
+docs.md
+
+
+.claude/
